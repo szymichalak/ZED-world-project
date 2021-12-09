@@ -1,0 +1,482 @@
+---
+title: "Analiza gospodarki USA na przestrzeni ostatnich lat"
+author: "Szymon Michalak"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+knit: (function(input_file, encoding) {
+  out_dir <- 'html';
+  rmarkdown::render(input_file, encoding=encoding, output_file=file.path(dirname(input_file), out_dir, 'index.html'))
+ })
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  message=FALSE, warning = FALSE, error = FALSE
+)
+```
+# Executive summary
+Poniższa analiza została wykonana w celu sprawdzenia wpływu gospodarki Stanów Zjednoczonych na cenę złota.
+<br />
+Zbiór danych, który jest punktem wyjściowym niniejszej analizy obejmuje różne płaszczyzny związane z gospodarką światową. Dobrobyt krajów, ceny złota, kursy walut czy Bitcoina to tylko nieliczne z cech, które zostały przeanalizowane pod względem zależności między sobą. 
+<br />
+Dane zbierane z dzienną częstotliwością zostały zagregowane do roku, dzięki czemu wszystkie informacje mają wspólny mianownik. Z danych źródłowych wybrano tylko te najistotniejsze cechy, które mogą mieć wpływ na siebie.
+<br /> 
+Wyselekcjonowane dane zostały poddane analizie korelacji Pearsona, dzięki czemu można sprawdzić zależności pomiędzy poszczególnymi cechami.
+<br />
+Nastepnym krokiem jest predyckja cen złota względem pozostałch atrybutów. Wykorzystując uczenie maszynowe, które na podstawie zebranych danych probuje przewidzieć cenę tego popularnego kruszca. 
+
+# Użyte biblioteki
+```{r init-libraries}
+library(readxl)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(DT)
+library(knitr)
+library(kableExtra)
+library(tibble)
+library(corrplot)
+library(gganimate)
+library(caret)
+library(randomForest)
+library(varImp)
+```
+
+```{r functions, echo=FALSE}
+theme_set(theme_bw())
+
+prettyTable <- function(table_df, round_digits=2) {
+    DT::datatable(table_df, style="bootstrap", filter = "top", rownames = FALSE, extensions = "Buttons", options = list(dom = 'Bfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print'))) %>% formatRound(names(dplyr::select_if(table_df, is.numeric)), round_digits)
+}
+```
+
+# Ładowanie i czyszczenie danych
+## Wstęp
+Każdy ze zbiorów danych charakteryzuje się innym przedziałem czasowy. Dane odnośnie gospodarki USA były zbierane w lata 1970-2020 z roczną częstotliwością.<br />
+Dane zbierane z dzienną częstotliwością to: <br />
+ceny złota od 1968 do 2021 <br />
+kursy walut 1995 - 2018<br />
+akcje S&P Composite od 1871 do 2021<br />
+bitcoin natomiast od 2009 do 2021 rok<br />
+<br />
+Z tych wszystkich przedziałów należało wybrać jeden wspólny obejmujący jak największy zakres danych. Głównym czynnikiem stał się tutaj zbiór danych z kursem walut. To głównie on determinował końcowy kształt danych. Wykorzystano dane zebrane w latach 1995 - 2018 oraz nastepnie wykonano agregację do roku. W ten sposób powstały 24 rekordy. Aby dane były jak najbardziej aktualne postanowiono pobrać dane z innego źródła, które zawierają przedział 2018 - 2020. W ten sposób powstało 26 rekordów przedstawiających dane na przestrzeni lata 1995-2020. Dane o gosporarce zostały przefiltrowane, aby przedział czasowy zgadzał się z przyjętymi ramami. Dane o akcjach S&P Composite również zostały zagregowane do roku i wybrano lata 1995-2020. Pewnym problemem okazały się informacje na temat kryptowaluty. Ich zakres był znacznie krótszy. Jednak można było zauważyć, że dane od 2009 roku, do 2015 miały wartość równą 0. Bitcoin nie był w tym okresie tak polularny więc na tej podstawie uzupełniono wcześniejsze puste wartości z przedziału 1995-2009 wartościami 0.
+<br />
+W ten sposób powstały zbiór danych obejmuje okrez 26 lat, zaczynając od danych z 1995, a kończąc na 2020 włącznie.
+
+## Dane o USA
+```{r import-data-usa, cache=TRUE, echo=TRUE}
+  col_names <- as.character(read_excel(
+    "./ZED_project_1_data/World_Development_Indicators.xlsx",
+    n_max = 1,
+    col_names = FALSE
+  ))
+  usa_data_dirty <- read_excel(
+    "./ZED_project_1_data/World_Development_Indicators.xlsx",
+    sheet = 1,
+    na = "..",
+    skip = 40258,
+    n_max = 213,
+    col_names = col_names) %>%
+    select(-c(1:3)) %>%
+    select(-c(2:26)) %>%
+    rename("Code" = "Series Code")
+```
+```{r data-transpose, echo=TRUE}
+usa_data <- usa_data_dirty %>%
+  pivot_longer(!Code, names_to = "Year", values_to = "value") %>%
+  pivot_wider(names_from = Code, values_from = value)
+
+get_year <- function(value) { substr(value, 0,4) }
+usa_data <- usa_data %>% mutate(Year = get_year(Year))
+```
+Aby zapewnić czystość zbioru danych należało przekrztałcić zbiór danych do postaci, gdzie rok był jedną z kolumn i pozostałe cechy były pozostałymi kolumnami. W ten sposób jeden rekord odpowiada jednej obserwacji w ciągu roku. <br />
+Liczba atrybutów: `r ncol(usa_data) - 1`.
+
+### Odrzucanie niewypełnionych kolumn
+```{r data-removing, echo=TRUE}
+calc_filled_rate <- function(data, threshold) {
+  na_sum <- data.frame(colSums(is.na(data))) %>%
+    rename("NA_count" = "colSums.is.na.data..") %>%
+    filter(NA_count <= threshold)
+    nrow(na_sum)
+}
+
+seq <- seq(0, 26, by=1)
+result_vec <- c()
+for(th in seq) {
+  result_vec <- c(result_vec, calc_filled_rate(usa_data, th))
+}
+
+th = 0
+result_df <- data.frame(Left=result_vec, NA_values=c(0:26))
+ggplot(result_df, aes(x=NA_values, y=Left)) + 
+  geom_line() + 
+  labs(x="Liczba pustych wartości", y="Pozostało atrybutów") + 
+  scale_x_continuous(breaks=seq(0, 26, 2)) +
+  scale_y_continuous(breaks=seq(0, 225, 25))  +
+  ylim(0, 225)
+```
+
+Powyższy wykres przedstawia zależność nieodrzuconych atrybutów od liczby pustych wartości w danym atrybucie. Z uwagi na fakt, że każda cecha charakteryzuje się swoimi prawami ciężko wyznaczyć jakiś wspólny sposób uzupełniania pustych wartości. Posiadająć tak dużą liczbę atrybutów można zastosować strategię odrzucenia nie w pełni wypełnionych cech. W ten sposób dane będą rzeczywiste, nie wstąpią żadne przybliżenia co może skutkować podniesieniem skuteczności analizy.
+```{r data-removing-2}
+cond <- sapply(usa_data, function(col) { sum(is.na(col)) > th})
+usa_data <- usa_data[,!cond,drop=FALSE]
+```
+Liczba w pełni wypełnionych atrybutów wynosi `r ncol(usa_data) - 1`. <br />
+Liczba odrzuconych atrybutów: `r sum(cond)`.
+
+### Odrzucanie duplikatów i mniej znaczących cech
+```{r data-removing-3}
+interesting_col <- c(
+  "Year", "SP.URB.TOTL", "SL.UEM.TOTL.NE.ZS",
+  "GC.TAX.GSRV.CN", "BM.GSR.NFSV.CD", "BX.GSR.NFSV.CD",
+  "CM.MKT.INDX.ZG", "SP.POP.TOTL", "EN.URB.LCTY",
+  "SP.POP.65UP.TO.ZS", "SP.POP.1564.TO.ZS", "SP.POP.0014.TO.ZS",
+  "FM.AST.DOMS.CN", "SL.TLF.TOTL.IN", "FP.CPI.TOTL.ZG",
+  "BX.GSR.MRCH.CD", "BM.GSR.MRCH.CD", "NY.GDP.MKTP.CD"
+)
+usa_data <- usa_data %>% select(interesting_col)
+usa_data <- usa_data %>% 
+  rename("Urban population"="SP.URB.TOTL") %>%
+  rename("Unemployment"="SL.UEM.TOTL.NE.ZS") %>%
+  rename("Taxes"="GC.TAX.GSRV.CN") %>%
+  rename("Service import"="BM.GSR.NFSV.CD") %>%
+  rename("Service export"="BX.GSR.NFSV.CD") %>%
+  rename("S&P Global"="CM.MKT.INDX.ZG") %>%
+  rename("Population"="SP.POP.TOTL") %>%
+  rename("Pop. in large cities"="EN.URB.LCTY") %>%
+  rename("Pop. over 65"="SP.POP.65UP.TO.ZS") %>%
+  rename("Pop. from 15 to 64"="SP.POP.1564.TO.ZS") %>%
+  rename("Pop. below 14"="SP.POP.0014.TO.ZS") %>%
+  rename("Net credit"="FM.AST.DOMS.CN") %>%
+  rename("Labor force"="SL.TLF.TOTL.IN") %>%
+  rename("Inflation"="FP.CPI.TOTL.ZG") %>%
+  rename("Goods exports"="BX.GSR.MRCH.CD") %>%
+  rename("Goods imports"="BM.GSR.MRCH.CD") %>%
+  rename("GDP"="NY.GDP.MKTP.CD")
+```
+Zbiór danych zawierał bardzo dużo pozornie zduplikowanych informacji. Liczebność populacji, liczebność męskiej części populacji, liczebność damskiej części populacji zależą mocno od siebie. Tak samo jak podatki wpływają na siebie. Zwiększenie jednego ciągnie za sobą kolejne podatki. W ten sposób wybrano jeden główny podatek, a reszta wartości zostala odrzucona. Cechy, które zostały wybrane mają potencjalny wpływ na kształt gospodarki Stanów Zjednoczonych, ale też nie są danymi zduplikowanymi. <br />
+W sumie wybrano `r ncol(usa_data) - 1` atrybutów.
+
+
+## Dane o cenie złota
+```{r import-gold-prices, cache=TRUE}
+  gold_prices <- read.csv("./ZED_project_1_data/Gold prices.csv", na.strings = "") %>% 
+  filter(substr(Date, 0,4) != "2021") %>%
+  filter(substr(Date, 0,4) >= "1995") %>%
+  group_by(substr(Date, 0,4)) %>% 
+  summarize( GOLD.USD = (mean(USD..AM., na.rm=TRUE)  + mean(USD..PM., na.rm=TRUE))/2) %>%
+  rename("Year"= "substr(Date, 0, 4)") 
+```
+```{r draw-gold-prices, echo=FALSE}
+ggplot(gold_prices, aes(x=Year, y=GOLD.USD)) + geom_line(aes(group=1)) + geom_point() + scale_x_discrete(breaks=seq(1995, 2020, 5))
+
+gold_prices <- rename(gold_prices, "Gold Price" = "GOLD.USD")
+```
+
+Dane o cenie złota zostały zagregowane do roku przy użyciu średniej z poszczególnych dni. Puste wartości zostały odrzucone, ze względu na niewielki wpływ na końcowy wynik. Wybrano tylko dane o cenie podanej w dolarach amerykańskich.
+
+## Dane o kursie GBP
+```{r import-exchange-rates, cache=TRUE}
+  currency_exchange_1 <- read.csv(
+    "./ZED_project_1_data/CurrencyExchangeRates.csv",
+    na.strings = ""
+  ) %>% 
+  filter(substr(Date, 0,4) <= "2017") %>%
+  filter(substr(Date, 0,4) >= "1995") %>%
+  group_by(substr(Date, 0,4)) %>% 
+  summarize(GBP = (mean(U.K..Pound.Sterling, na.rm=TRUE))) %>%
+  rename("Year"= "substr(Date, 0, 4)")
+
+  currency_exchange_2 <- read_excel(
+    "./ZED_project_1_data/CurrencyExchangeRates_newest.xlsx",
+    sheet = 1,
+  ) %>% 
+  filter(substr(Date, 0,4) <= "2020") %>%
+  filter(substr(Date, 0,4) >= "2018") %>%
+  group_by(substr(Date, 0,4)) %>% 
+  summarize(GBP = (mean(USD, na.rm=TRUE))) %>%
+  rename("Year"= "substr(Date, 0, 4)")
+  
+  currency_exchange <- rbind(
+    currency_exchange_1,
+    currency_exchange_2
+  )
+
+```
+```{r draw-exchange-rates, echo=FALSE}
+ggplot(currency_exchange, aes(x = Year, y = GBP)) + geom_line(aes(group=1)) + geom_point() + scale_x_discrete(breaks=seq(1995, 2020, 5))
+
+currency_exchange <- rename(currency_exchange, "GBP Exchange" = "GBP")
+```
+
+Dane o kursie Dolar Amerykański -> Funt Brytyjski powstały z dwóch plików źródłowych. Jedne dane pochodzą z lat 1995-2017, drugie natomiast z lat 2018-2020. Jako, że kurs walut jest wartością stałą dla każdego źródła można wykonać operacje połączenia tych danych w jeden spójny zbiór. Agregacja do lat powstała przy wyliczniu średniej z dni, a wartości puste zostały pominięte. Ich wypełnienie wartością średnią czy interpoacją liniową miałaby znikomy wpływ na końcowy rezultat. <br />
+Dlaczego akurat Funt Brytyjski? Ta waluta wybrana została ze względu na swoją mocną pozycję na rynku światowym. Jest ona stosunkowo stabilna i stanowy dobry punkt odniesienia. 
+
+## Dane o bitcoinie
+```{r import-bitcoin-mkpru, cache=TRUE}
+  bitcoin_mkpru <- read.csv("./ZED_project_1_data/Bitcoin/BCHAIN-MKPRU.csv", na.strings = "") %>% 
+  filter(substr(Date, 0,4) != "2021") %>%
+  filter(substr(Date, 0,4) >= "1995") %>%
+  group_by(substr(Date, 0,4)) %>% 
+  summarize(BTC.USD = (mean(Value, na.rm=TRUE))) %>%
+  rename("Year"= "substr(Date, 0, 4)")
+```
+```{r draw-bitcoin-mkpru, echo=FALSE}
+fill_zeroes <- data.frame(Year=as.character(c(1995:2008)), BTC.USD=replicate(14, 0))
+bitcoin_filled = bind_rows(fill_zeroes, bitcoin_mkpru)
+ggplot(bitcoin_filled, aes(x = Year, y = BTC.USD)) + 
+  labs(title="Średnia wartość 1 BTC [USD]") +
+  geom_line(aes(group=1)) + 
+  geom_point() + 
+  scale_x_discrete(breaks=seq(1995, 2020, 5)) + 
+  ggtitle("Średnia cena 1 BTC [USD]")
+```
+
+```{r import-bitcoin-hrate, cache=TRUE}
+  thashes <- read.csv("./ZED_project_1_data/Bitcoin/BCHAIN-HRATE.csv", na.strings = "") %>% 
+  filter(substr(Date, 0,4) != "2021") %>%
+  filter(substr(Date, 0,4) >= "1995") %>%
+  group_by(substr(Date, 0,4)) %>% 
+  summarize(THASH = (mean(Value, na.rm=TRUE))) %>%
+  rename("Year"= "substr(Date, 0, 4)")
+```
+```{r draw-bitcoin-hrate, echo=FALSE}
+fill_zeroes <- data.frame(Year=as.character(c(1995:2008)), THASH=replicate(14, 0))
+thashes_filled = bind_rows(fill_zeroes, thashes)
+ggplot(thashes_filled, aes(x = Year, y = THASH)) + 
+  labs(title="Średnia liczba wykonanych operacji hashujących [w bilionach]") +
+  geom_line(aes(group=1)) + 
+  geom_point() + 
+  scale_x_discrete(breaks=seq(1995, 2020, 5))
+
+```
+
+```{r import-bitcoin-diff, cache=TRUE}
+  diffs <- read.csv("./ZED_project_1_data/Bitcoin/BCHAIN-DIFF.csv", na.strings = "") %>% 
+  filter(substr(Date, 0,4) != "2021") %>%
+  filter(substr(Date, 0,4) >= "1995") %>%
+  group_by(substr(Date, 0,4)) %>% 
+  summarize(DIFF = (mean(Value, na.rm=TRUE))) %>%
+  rename("Year"= "substr(Date, 0, 4)")
+```
+```{r draw-bitcoin-diff, echo=FALSE}
+fill_zeroes <- data.frame(Year=as.character(c(1995:2008)), DIFF=replicate(14, 0))
+diff_filled = bind_rows(fill_zeroes, diffs)
+ggplot(diff_filled, aes(x = Year, y = DIFF)) + 
+  labs(title="Średnia trudność w wydobyciu nowego BTC") +
+  geom_line(aes(group=1)) + 
+  geom_point() + 
+  scale_x_discrete(breaks=seq(1995, 2020, 5))
+
+```
+
+```{r import-bitcoin-trvou, cache=TRUE}
+  trvou <- read.csv("./ZED_project_1_data/Bitcoin/BCHAIN-TRVOU.csv", na.strings = "") %>% 
+  filter(substr(Date, 0,4) != "2021") %>%
+  filter(substr(Date, 0,4) >= "1995") %>%
+  group_by(substr(Date, 0,4)) %>% 
+  summarize(TRVOU = (mean(Value, na.rm=TRUE))) %>%
+  rename("Year"= "substr(Date, 0, 4)")
+```
+```{r draw-bitcoin-trvou, echo=FALSE}
+fill_zeroes <- data.frame(Year=as.character(c(1995:2008)), TRVOU=replicate(14, 0))
+trvou_filled = bind_rows(fill_zeroes, trvou)
+ggplot(trvou_filled, aes(x = Year, y = TRVOU)) + 
+  labs(title="Średnia sumaryczna wartość wydobytych BTC [USD]") +
+  geom_line(aes(group=1)) + 
+  geom_point() + 
+  scale_x_discrete(breaks=seq(1995, 2020, 5))
+
+```
+
+Już po szybkiej analizie kształtów powyższych wykresów można dojść do wniosku, że dane w te są mocno skorelowane. Wynika to z faktu, że bitcoin przez długi czas nie istniał (do 2009 roku). Brak danych został zamieniony na wartości 0. Od 2009 roku do 2017 ta waluta była mało popularna i jej wartość była niska. Dopiero po 2017 roku kryptowaluty stały bardzo popularne co za tym idzie ich cena oraz chęć wydobycia poszły do góry.
+
+```{r bitcoin-concatenation}
+bitcoin <- cbind(
+  bitcoin_filled, 
+  select(thashes_filled, -1),
+  select(diff_filled, -1),
+  select(trvou_filled, -1)
+)
+
+bitcoin_M<-cor(select(bitcoin, -1))
+corrplot(bitcoin_M, method="color")
+```
+
+Z powyższego wykresu korelacji widać, że cena 1 bitcoina jest bardzo mocno powiązana z liczbą wykonanych operacji hashujących oraz trudnościami w wydobyciu. Natomiast wspólczynnik korelacji dla sumarycznej wartości bitcoinów jest mniejszy niż dla pozostałych porównań. W związku z faktem, że dane są bardzo zbliżone do siebie, odrzucono 3 kolumny i zostawiono tylko wartość 1 bitcoina.
+
+```{r bitcoin-removing-columns}
+bitcoin <- bitcoin %>% select(c(1:2)) %>% rename("Bitcoin price" = "BTC.USD")
+```
+
+## Dane o akcjach S&P Composite
+Dane dotyczące akcji S&P Composite zostały pogrupowane w lata oraz wybrano dane pomiędzy 1995 rokiem, a 2020. Dla każdego wspólczynnika wyliczono średnią w roku, a wartości puste zostały pominięte. 
+```{r import-composite, cache=TRUE}
+  composite <- read.csv("./ZED_project_1_data/S&P Composite.csv", na.strings = "") %>% 
+  filter(substr(Year, 0,4) != "2021") %>%
+  filter(substr(Year, 0,4) >= "1995") %>%
+  group_by(substr(Year, 0,4))  %>%
+  summarize(
+    Composite = (mean(S.P.Composite, na.rm=TRUE)),
+    Dividend = (mean(Dividend, na.rm=TRUE)),
+    Earnings = (mean(Earnings, na.rm=TRUE)),
+    CPI = (mean(CPI, na.rm=TRUE)),
+    Long_Interest_Rate = (mean(Long.Interest.Rate, na.rm=TRUE)),
+    Real_Price = (mean(Real.Price, na.rm=TRUE)),
+    Real_Dividend = (mean(Real.Dividend, na.rm=TRUE)),
+    Real_Earnings = (mean(Real.Earnings, na.rm=TRUE)),
+    Cyclically_Adjusted_PE_Ratio = (mean(Cyclically.Adjusted.PE.Ratio, na.rm=TRUE)) 
+  ) %>%
+  rename("Year"= "substr(Year, 0, 4)") %>%
+  rename("Long Interest Rate"= "Long_Interest_Rate") 
+```
+```{r composite-corelation}
+composite_M<-cor(select(composite, -1))
+corrplot(composite_M, method="color")
+```
+
+Wykres korelacji pokazuje, że większość danych jest ze sobą powiązanych. W ten sposób zostawiono współczynnik Composite, a odrzucono: Dividend, Earings, CPI, Real Price, Real Dividend i Real Earings. W wyżej wymienionych atrybutach współczynnik korelacji wynosił 0.5 - 0.9. Long Interest Rate jest mocno odwrotnie skorelowane do współczynnika Composite (wartość -0.7). Ostatnia cecha nie jest powiązana z pozostałymi, dlatego zostanie usunięta. 
+
+```{r composite-remove-data}
+composite <- composite %>% select(c(1, 2, 6))
+```
+
+## Łączenie czystych danych
+```{r join-data, echo=TRUE}
+df <- cbind(
+  usa_data,
+  select(gold_prices, -1),
+  select(currency_exchange, -1),
+  select(bitcoin, -1),
+  select(composite, -1)
+)
+```
+Komenda select(df, -1) odrzuca kolumnę z rokuem, aby nie duplikować wartości. 
+
+# Podsumowanie danych
+```{r prepare-summary}
+summary_df <- df %>% pivot_longer(!Year, names_to = "Code", values_to = "Value")
+```
+## Analiza wartości parametrów
+```{r data-plots, cache=TRUE}
+ggplot(summary_df, aes(x=Year, y=Value)) +
+   geom_line(aes(group=1)) +
+  geom_point() +
+  scale_x_discrete(breaks=seq(1995, 2020, 10)) +
+  facet_wrap(. ~ Code, scales="free_y", nrow=6)
+```
+
+Na postawie powyższych wykresów można zauważyć ciekawe zależności. Na przykład import i eksport dóbr przedstawiają się w analogicznym kształcie. W tych samych latach następował wzrost i spadek. Import i export usług tak samo. Można nawet zaobserwować spadek w roku 2020. Jest to spowodowane pandemią Covid-19. <br/>
+Społeczeństwo Stanów Zjednoczonych staje się coraz starsze. Procentowy udział młodych ludzi spada, a starszych wzrasta.
+
+## Podstawowe statystyki atrybutów
+```{r data-boxplots, cache=TRUE}
+ggplot(summary_df, aes(y=Value)) +
+  geom_boxplot() +
+  labs(x="", y="") + 
+  facet_wrap(. ~ Code, scales="free_y", nrow=6) + 
+  theme(axis.text.x = element_blank()) +
+  theme(axis.ticks.x = element_blank())
+```
+
+# Korelacja
+```{r data-corelation}
+cor_mat <- cor(
+  x = select(df, -1), 
+  use="pairwise.complete.obs"
+)
+
+cor_df = data.frame(round(cor_mat,2)) %>% 
+ rownames_to_column() %>%
+ pivot_longer(-rowname, names_to="colname")
+
+cor_plot <- ggplot(cor_df, aes(colname, rowname, fill=value)) + 
+  geom_tile() +
+  scale_fill_gradient2() + 
+  theme(axis.text.x=element_text(angle = 90, hjust = 0))
+
+ggplotly(cor_plot)
+```
+
+Powyższy wykres przedstawia wartość korelacji Pearsona na analizowanym zbiorze danych. Zaskakujący jest fakt, że inflacja, bezrobocie i procentowy udział osób w przedziale wiekowym 15-64 nie jest powiązany z gospodarką kraju. Nie wpływa to na eksport czy import, podatki czy PKB. Natomiast procentowy udział dzieci w społeczeństwie jest mocno powiązany z większością analizowanych cech. 
+
+# Cena złota w zależności od kursu GBP i inflacji
+```{r animated-plot, cache=TRUE}
+animated_plot <- df %>% 
+  select("Year", "Inflation", "Gold Price", "GBP Exchange") %>%
+  rename("Gold.Price" = "Gold Price") %>%
+  rename("GBP.Exchange" = "GBP Exchange")
+animated_plot[, 1] <- sapply(animated_plot[, 1], as.integer)
+
+p <- ggplot(animated_plot, aes(x=GBP.Exchange, y=Gold.Price, size = Inflation)) +
+  geom_point(show.legend = FALSE, alpha = 0.7) +
+  labs(title = 'Rok: {frame_time}', x = "Kurs GBP", y = "Cena złota [USD]") +
+  transition_time(Year) 
+
+animate(p)
+```
+
+Z powyższej animacji można wywnioskować, kiedy opłacało się importować czy eksportować złoto z lub do Wielkiej Brytanii. Wielkość kropki powiązana jest z inflacją. Im mniejsza wartość inflacji tym lepiej. Ostatnie lata mają dobre cechy do importu tego surowca. Inflacja jest niewielka, kurs GBP korzystny (kupujący płaci mniej), a cena złota idzie w górę. Porównując do poprzenich lat, okres 2017-2020 jest najbardziej opłacalny.
+
+
+
+
+# Regresja
+```{r prepare-data-regression}
+df_data <- df %>% select(-Year) %>% rename("Gold.Price" = "Gold Price")
+
+percent_in_train = 0.8
+split <- floor(nrow(df_data) * percent_in_train)
+
+train <- df_data[1:split,]
+test <- df_data[split+1:nrow(df_data),]
+```
+Zbiór danych został podzielony na zbiór treningowy (80% całości) i zbiór testowy (20% całości). Podział nastąpił na podstawie czasu. Zbiór treningowy to początkowy okres danych, a zbiór testowy to końcowy okres danych. Dzięki temu model można wytrenować na danych wcześniejszych, przetestować na danych późniejszych i porównać z rzeczywistymi wartościami. 
+```{r model-training}
+ctrl <- trainControl(method = "repeatedcv", number = 2, repeats = 5)
+
+fit <- train(
+  Gold.Price ~ .,
+  data = train,
+  method = "rf",
+  trControl = ctrl,
+  ntree = 30
+)
+fit
+
+prediction <- predict(fit, newdata = test)
+prediction
+
+gold <- gold_prices[split+1:nrow(gold_prices),] %>% filter(!is.na(Year)) %>% rename("Real" = "Gold Price")
+compare <- cbind(gold, data.frame(Prediction = as.vector(prediction))) 
+compare <- compare %>% pivot_longer(!Year, names_to = "Type", values_to = "Values")
+
+ggplot(compare, aes(x=Year, y=Values)) +
+  facet_wrap(. ~ Type) +
+  geom_point() +
+  geom_line(aes(group=1))
+```
+
+Analizując miary oceny można zauważyć, że współczynnik Rsquared (Współczynnik determinacji) ma wartość bardzo bliską maksymanej wartości. Jest to współczynnik bezwględny, a co za tym idzie jego wynik jest lepiej interpretowalny przez odbiorce. Pozostałe parametry są względne i zależą od wartości przewidywanego atrybutu. Widząc wartość 120 (MAE) czy 150 (RMSE) nie wiadomo, czy to jest dobry wynik czy zły. 
+<br /> 
+Jednak uwzględniając tylko miarę oceny Rsquared można dojść do wniosku, że dane zostały wytrenowane poprawnie.
+<br />
+Powyższy wykres porównuje dane przewidziane i dane rzeczywiste. Można zaobserwować podobny kształt wykresu, jednak predykcja jest trochę spłaszczona. Testowany model przewidział wzrost ceny złota w latach 2019-2020, po wcześniejszym stabilnym okresie.
+
+# Ważność atrybutów
+```{r variable-importance}
+gbmImp <- caret::varImp(fit, scale = FALSE)
+plot(gbmImp, top = 10)
+```
+
+Z powyższego wykresu ważności atrybutów można wyciągnąć informacje o tym, które atrybuty model uważa za najważniejsze w swoim trenowaniu. Ku zaskoczeniu na pierwszym miejscu znajduje się populacja ludzi poniżej 14 roku życia. Może to właśnie dzieci determinują zmiany w cenie złota. Wysoka pozycja bitcoina też jest zaskakująca, gdyż jest to nowy twór, który na przestrzeni ostatnich trzech lat wybił się bardzo mocno. Dopiero na kolejnych miejscach znajdują się usługi na rzecz innych krajów, siła robocza czy populacja w miastach.
+
+
+
+
+
